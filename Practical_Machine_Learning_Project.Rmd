@@ -1,0 +1,119 @@
+---
+title: "Predicting Exercise Quality from Wearable Accelerometers"
+author: "Ulzhan Askarkyzy"
+date: "2026-11-09"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, fig.width=7, fig.height=4)
+set.seed(20261109)
+library(caret)
+library(randomForest)
+library(rpart)
+library(ggplot2)
+```
+
+## Executive summary
+
+The aim is to predict how six participants performed barbell lifting exercises using wearable accelerometer readings. The target, `classe`, has five levels (A–E). We compare a classification tree with a random forest using stratified training/validation data and repeated cross-validation, then estimate out-of-sample classification error using a held-out validation set. The winning algorithm is applied to 20 unlabeled cases from the course test file. This is predictive analysis, not causal inference.
+
+## Data and preprocessing
+
+The training dataset and 20-case testing dataset are provided by the Practical Machine Learning course. Removing administrative identifiers, timestamps, and columns with extensive missingness reduces leakage and produces comparable measurement features across training and testing.
+
+```{r data}
+train_url <- 'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv'
+test_url  <- 'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv'
+if (!file.exists('pml-training.csv')) download.file(train_url, 'pml-training.csv', mode='wb')
+if (!file.exists('pml-testing.csv')) download.file(test_url, 'pml-testing.csv', mode='wb')
+raw_train <- read.csv('pml-training.csv', na.strings=c('', 'NA', '#DIV/0!'))
+raw_test  <- read.csv('pml-testing.csv', na.strings=c('', 'NA', '#DIV/0!'))
+stopifnot(nrow(raw_test) == 20, 'classe' %in% names(raw_train))
+exclude <- c('X','user_name','raw_timestamp_part_1','raw_timestamp_part_2',
+             'cvtd_timestamp','new_window','num_window','classe','problem_id')
+candidate <- intersect(setdiff(names(raw_train), exclude), names(raw_test))
+keep <- candidate[vapply(candidate, function(z) {
+  is.numeric(raw_train[[z]]) && is.numeric(raw_test[[z]]) &&
+  mean(is.na(raw_train[[z]])) < 0.05 && all(!is.na(raw_test[[z]]))
+}, logical(1))]
+dat <- raw_train[, c(keep, 'classe')]
+dat <- dat[complete.cases(dat), ]
+dat$classe <- factor(dat$classe)
+quiz <- raw_test[, keep, drop=FALSE]
+cat('Training rows:', nrow(dat), '; predictor columns:', length(keep), '\n')
+print(table(dat$classe))
+```
+
+## Exploratory analysis
+
+The bar plot below summarizes class balance. Class proportions should be preserved in splitting and cross-validation.
+
+```{r plot, fig.cap='Counts of exercise quality classes in training data'}
+ggplot(dat, aes(x=classe, fill=classe)) + geom_bar(show.legend=FALSE) +
+  labs(x='Exercise class', y='Observations') + theme_minimal()
+```
+
+## Model selection and cross-validation
+
+The training file is split 70/30 using stratification. To avoid using the held-out set to tune hyperparameters, we train a single decision tree and random forest with repeated 5-fold cross-validation **only on the training partition**. We use overall accuracy as the selection criterion; the validation partition is used once to estimate generalization error. A random forest accommodates nonlinear interactions and correlated accelerometer features without assuming a linear decision boundary.
+
+```{r models, cache=TRUE}
+idx <- createDataPartition(dat$classe, p=0.70, list=FALSE)
+dev <- dat[idx, , drop=FALSE]
+holdout <- dat[-idx, , drop=FALSE]
+ctrl <- trainControl(method='repeatedcv', number=5, repeats=2)
+fit_tree <- train(classe ~ ., data=dev, method='rpart', trControl=ctrl,
+                  tuneLength=5, metric='Accuracy')
+fit_rf <- train(classe ~ ., data=dev, method='rf', trControl=ctrl,
+                tuneLength=3, metric='Accuracy', ntree=300)
+comparison <- resamples(list(Tree=fit_tree, RandomForest=fit_rf))
+print(summary(comparison))
+selected <- if (max(fit_rf$results$Accuracy) >= max(fit_tree$results$Accuracy)) fit_rf else fit_tree
+cat('Selected model:', selected$method, '\n')
+```
+
+## Out-of-sample performance
+
+The holdout set was never used for model selection. Its misclassification rate is our estimate of expected error for additional observations drawn comparably to the training data. Results may differ somewhat with a different random seed, split, or R/package version. Performance can be lower for new people, devices, or collection conditions.
+
+```{r validation}
+hold_pred <- predict(selected, newdata=holdout)
+cm <- confusionMatrix(hold_pred, holdout$classe)
+print(cm)
+acc <- as.numeric(cm$overall['Accuracy'])
+n <- nrow(holdout)
+errors <- sum(hold_pred != holdout$classe)
+cat(sprintf('Holdout accuracy: %.4f; estimated out-of-sample error: %.4f (%d/%d)\n',
+            acc, errors/n, errors, n))
+cat('Approximate 95% binomial interval for error rate:\n')
+print(binom.test(errors, n)$conf.int)
+```
+
+## Predictions for the 20 course cases
+
+For the quiz predictions, the model selected above is refit on the entire labeled dataset using the selected algorithm and tuning parameter. This maximizes the training information available at final prediction time.
+
+```{r final-predictions, cache=TRUE}
+final_model <- if (selected$method == 'rf') {
+  randomForest(classe ~ ., data=dat, mtry=selected$bestTune$mtry, ntree=500)
+} else {
+  rpart(classe ~ ., data=dat, cp=selected$bestTune$cp)
+}
+quiz_pred <- predict(final_model, newdata=quiz)
+print(data.frame(problem_id=raw_test$problem_id, prediction=quiz_pred), row.names=FALSE)
+write.csv(data.frame(problem_id=raw_test$problem_id, prediction=quiz_pred),
+          'quiz_predictions.csv', row.names=FALSE)
+```
+
+## Discussion and limitations
+
+This approach uses a physically meaningful set of sensor measurements and excludes variables likely to leak recording order, participant identities, or time. Cross-validation helps choose between a simple interpretable tree and a flexible ensemble, while a separate holdout guards against overly optimistic training performance. The reported validation accuracy is conditional on a random row-wise split: sessions from the same six participants may occur in both subsets. Therefore, the error rate may understate error for entirely new participants. A group-based validation design would better estimate transfer to unseen individuals.
+
+## Data attribution
+
+Weight Lifting Exercises Dataset, provided by the original researchers through the Coursera Practical Machine Learning course. Original project: https://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
